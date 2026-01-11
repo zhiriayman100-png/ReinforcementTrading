@@ -1,16 +1,21 @@
 import os
+import json
+import time
+from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback
 
 from indicators import load_and_preprocess_data
-from trading_env import ForexTradingEnv
+from env.trading_env import ForexTradingEnv
+from agents.ppo_agent import PPOAgent
+from config import MODELS_DIR, CKPT_DIR, TENSORBOARD_DIR
+from utils.plotting import plot_equity_curves, plot_single_curve
 
 
-def evaluate_model(model: PPO, eval_env: DummyVecEnv, deterministic: bool = True):
+def evaluate_model(model, eval_env, deterministic: bool = True):
     obs = eval_env.reset()
     equity_curve = []
 
@@ -39,8 +44,28 @@ def evaluate_model(model: PPO, eval_env: DummyVecEnv, deterministic: bool = True
 
 
 def main():
-    #file_path = "data/EURUSD_15 Mins_Ask_2020.12.06_2025.12.12.csv"
-    file_path = "data/EURUSD_Hourly_Ask_2015.12.01_2025.12.16.csv"
+    # Prefer existing files in the `data/` directory. You can override by setting
+    # the `DATA_CSV` environment variable to a path.
+    default_candidates = [
+        os.environ.get("DATA_CSV", ""),
+        "data/EURUSD_Hourly_Ask_2015.12.01_2025.12.16.csv",
+        "data/EURUSD_15 Mins_Ask_2020.12.06_2025.12.12.csv",
+        "data/EURUSD_Candlestick_1_Hour_BID_01.07.2020-15.07.2023.csv",
+        "data/test_EURUSD_Candlestick_1_Hour_BID_20.02.2023-22.02.2025.csv",
+    ]
+
+    file_path = None
+    for candidate in default_candidates:
+        if not candidate:
+            continue
+        if os.path.exists(candidate):
+            file_path = candidate
+            break
+
+    if file_path is None:
+        raise FileNotFoundError(f"No candidate CSV found. Checked: {default_candidates}")
+
+    print(f"Using data file: {file_path}")
     df, feature_cols = load_and_preprocess_data(file_path)
 
     # Time split 80/20
@@ -118,45 +143,44 @@ def main():
     train_eval_env = DummyVecEnv([make_train_eval_env])
     test_eval_env = DummyVecEnv([make_test_eval_env])
 
-    # ---- Model ----
-    model = PPO(
-        policy="MlpPolicy",
+    # ---- Agent ----
+    agent = PPOAgent.from_scratch(
         env=train_vec_env,
+        policy="MlpPolicy",
         verbose=1,
-        tensorboard_log="./tensorboard_log/"
+        tensorboard_log=str(TENSORBOARD_DIR) + "/"
     )
 
     # ---- Checkpoints ----
-    ckpt_dir = "./checkpoints"
-    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_dir = CKPT_DIR
 
     checkpoint_callback = CheckpointCallback(
-        save_freq=50_000,
-        save_path=ckpt_dir,
+        save_freq=int(os.environ.get("CKPT_SAVE_FREQ", 50_000)),
+        save_path=str(ckpt_dir),
         name_prefix="ppo_eurusd"
     )
 
     # ---- Train ----
-    total_timesteps = 600000
-    model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback)
+    total_timesteps = int(os.environ.get("TOTAL_TIMESTEPS", 600000))
+    agent.train(env=train_vec_env, total_timesteps=total_timesteps, callback=checkpoint_callback)
 
     # ---- Select best model by OOS final equity ----
-    equity_curve_test_last, final_equity_test_last = evaluate_model(model, test_eval_env)
+    equity_curve_test_last, final_equity_test_last = evaluate_model(agent, test_eval_env)
     print(f"[OOS Eval] Last model final equity: {final_equity_test_last:.2f}")
 
     best_equity = -np.inf
     best_path = None
 
     ckpts = sorted(
-        [f for f in os.listdir(ckpt_dir) if f.endswith(".zip") and f.startswith("ppo_eurusd")],
-        key=lambda x: os.path.getmtime(os.path.join(ckpt_dir, x))
+        [f for f in os.listdir(str(ckpt_dir)) if f.endswith(".zip") and f.startswith("ppo_eurusd")],
+        key=lambda x: os.path.getmtime(os.path.join(str(ckpt_dir), x))
     )
 
     for ck in ckpts:
-        ck_path = os.path.join(ckpt_dir, ck)
+        ck_path = os.path.join(str(ckpt_dir), ck)
         try:
-            m = PPO.load(ck_path, env=test_eval_env)
-            _, final_eq = evaluate_model(m, test_eval_env)
+            ck_agent = PPOAgent.load(ck_path, env=test_eval_env)
+            _, final_eq = evaluate_model(ck_agent, test_eval_env)
             print(f"[OOS Eval] {ck} -> final equity: {final_eq:.2f}")
             if final_eq > best_equity:
                 best_equity = final_eq
@@ -167,30 +191,46 @@ def main():
     # Decide best model
     if best_path is None or final_equity_test_last >= best_equity:
         print("Using last model as best (by OOS final equity).")
-        best_model = model
+        best_agent = agent
     else:
         print(f"Using best checkpoint: {best_path} (OOS final equity: {best_equity:.2f})")
-        best_model = PPO.load(best_path, env=train_vec_env)
+        best_agent = PPOAgent.load(best_path, env=train_vec_env)
 
-    best_model.save("model_eurusd_best")
-    print("Best model saved: model_eurusd_best")
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_base = Path(MODELS_DIR) / f"ppo_eurusd_best_{ts}"
+    best_agent.save(str(out_base))
+
+    meta = {
+        "saved_at": ts,
+        "file": str(out_base) + ".zip",
+        "final_equity_test_last": float(final_equity_test_last),
+        "best_oos_equity": float(best_equity) if best_equity != -np.inf else None,
+        "total_timesteps": total_timesteps,
+    }
+    with open(str(out_base) + ".meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"Best model saved: {out_base}")
 
     # ---- Plot BOTH: in-sample vs out-of-sample ----
-    equity_curve_train, final_equity_train = evaluate_model(best_model, train_eval_env)
-    equity_curve_test, final_equity_test = evaluate_model(best_model, test_eval_env)
+    equity_curve_train, final_equity_train = evaluate_model(best_agent, train_eval_env)
+    equity_curve_test, final_equity_test = evaluate_model(best_agent, test_eval_env)
 
     print(f"[IS Eval]  Final equity (train): {final_equity_train:.2f}")
     print(f"[OOS Eval] Final equity (test) : {final_equity_test:.2f}")
 
-    plt.figure(figsize=(12, 6))
-    plt.plot(equity_curve_train, label="Train (in-sample) equity")
-    plt.plot(equity_curve_test, label="Test (out-of-sample) equity")
-    plt.title("Equity Curves: In-sample vs Out-of-sample (Best Model)")
-    plt.xlabel("Steps")
-    plt.ylabel("Equity ($)")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+    plot_equity_curves(
+        equity_curve_train,
+        equity_curve_test,
+        title="Equity Curves: In-sample vs Out-of-sample (Best Model)",
+        save_path=Path(MODELS_DIR) / f"equity_ppo_eurusd_{ts}.png",
+    )
+    print(f"Saved equity plot to {str(Path(MODELS_DIR) / f'equity_ppo_eurusd_{ts}.png')}")
+
+    try:
+        plt.show()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

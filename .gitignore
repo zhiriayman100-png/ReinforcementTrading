@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtualenv / venv
+venv/
+.env
+.env.*
+
+# Byte-compiled / caches
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Data (keep small files if needed)
+data/*.csv
+!data/.gitkeep
+
+# Models / logs
+models/
+checkpoints/
+tensorboard_log/
+
+# Large artifacts
+*.zip
+*.h5
+*.pt

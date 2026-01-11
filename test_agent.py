@@ -6,7 +6,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from indicators import load_and_preprocess_data
-from trading_env import ForexTradingEnv
+from env.trading_env import ForexTradingEnv
 
 
 def run_one_episode(model, vec_env, deterministic=True):
