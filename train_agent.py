@@ -143,13 +143,30 @@ def main():
     train_eval_env = DummyVecEnv([make_train_eval_env])
     test_eval_env = DummyVecEnv([make_test_eval_env])
 
-    # ---- Agent ----
-    agent = PPOAgent.from_scratch(
-        env=train_vec_env,
-        policy="MlpPolicy",
-        verbose=1,
-        tensorboard_log=str(TENSORBOARD_DIR) + "/"
-    )
+    # ---- Agent selection ----
+    model_type = os.environ.get("MODEL", "PPO").upper()
+
+    if model_type == "PPO":
+        agent = PPOAgent.from_scratch(
+            env=train_vec_env,
+            policy="MlpPolicy",
+            verbose=1,
+            tensorboard_log=str(TENSORBOARD_DIR) + "/"
+        )
+        ckpt_prefix = "ppo_eurusd"
+    elif model_type == "DQN":
+        from agents.dqn_agent import DQNAgent
+
+        agent = DQNAgent.from_scratch(
+            env=train_vec_env,
+            policy="MlpPolicy",
+            verbose=1,
+            tensorboard_log=str(TENSORBOARD_DIR) + "/",
+            buffer_size=int(os.environ.get("DQN_BUFFER", 50000)),
+        )
+        ckpt_prefix = "dqn_eurusd"
+    else:
+        raise ValueError(f"Unsupported MODEL type: {model_type}")
 
     # ---- Checkpoints ----
     ckpt_dir = CKPT_DIR
@@ -157,7 +174,7 @@ def main():
     checkpoint_callback = CheckpointCallback(
         save_freq=int(os.environ.get("CKPT_SAVE_FREQ", 50_000)),
         save_path=str(ckpt_dir),
-        name_prefix="ppo_eurusd"
+        name_prefix=ckpt_prefix
     )
 
     # ---- Train ----
@@ -172,14 +189,20 @@ def main():
     best_path = None
 
     ckpts = sorted(
-        [f for f in os.listdir(str(ckpt_dir)) if f.endswith(".zip") and f.startswith("ppo_eurusd")],
+        [f for f in os.listdir(str(ckpt_dir)) if f.endswith(".zip") and f.startswith(ckpt_prefix)],
         key=lambda x: os.path.getmtime(os.path.join(str(ckpt_dir), x))
     )
 
     for ck in ckpts:
         ck_path = os.path.join(str(ckpt_dir), ck)
         try:
-            ck_agent = PPOAgent.load(ck_path, env=test_eval_env)
+            if model_type == "PPO":
+                ck_agent = PPOAgent.load(ck_path, env=test_eval_env)
+            else:
+                from agents.dqn_agent import DQNAgent
+
+                ck_agent = DQNAgent.load(ck_path, env=test_eval_env)
+
             _, final_eq = evaluate_model(ck_agent, test_eval_env)
             print(f"[OOS Eval] {ck} -> final equity: {final_eq:.2f}")
             if final_eq > best_equity:
@@ -194,23 +217,33 @@ def main():
         best_agent = agent
     else:
         print(f"Using best checkpoint: {best_path} (OOS final equity: {best_equity:.2f})")
-        best_agent = PPOAgent.load(best_path, env=train_vec_env)
+        if model_type == "PPO":
+            best_agent = PPOAgent.load(best_path, env=train_vec_env)
+        else:
+            from agents.dqn_agent import DQNAgent
+
+            best_agent = DQNAgent.load(best_path, env=train_vec_env)
 
     ts = time.strftime("%Y%m%d_%H%M%S")
-    out_base = Path(MODELS_DIR) / f"ppo_eurusd_best_{ts}"
-    best_agent.save(str(out_base))
+    model_dir = Path(MODELS_DIR) / f"{model_type.lower()}_eurusd_best_{ts}"
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save model (SB3 will append .zip)
+    model_path_base = model_dir / "model"
+    best_agent.save(str(model_path_base))
 
     meta = {
+        "model_type": model_type,
         "saved_at": ts,
-        "file": str(out_base) + ".zip",
+        "file": str(model_path_base) + ".zip",
         "final_equity_test_last": float(final_equity_test_last),
         "best_oos_equity": float(best_equity) if best_equity != -np.inf else None,
         "total_timesteps": total_timesteps,
     }
-    with open(str(out_base) + ".meta.json", "w") as f:
+    with open(model_dir / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"Best model saved: {out_base}")
+    print(f"Best model saved under: {model_dir}")
 
     # ---- Plot BOTH: in-sample vs out-of-sample ----
     equity_curve_train, final_equity_train = evaluate_model(best_agent, train_eval_env)
@@ -219,13 +252,14 @@ def main():
     print(f"[IS Eval]  Final equity (train): {final_equity_train:.2f}")
     print(f"[OOS Eval] Final equity (test) : {final_equity_test:.2f}")
 
+    plot_path = model_dir / "equity.png"
     plot_equity_curves(
         equity_curve_train,
         equity_curve_test,
         title="Equity Curves: In-sample vs Out-of-sample (Best Model)",
-        save_path=Path(MODELS_DIR) / f"equity_ppo_eurusd_{ts}.png",
+        save_path=plot_path,
     )
-    print(f"Saved equity plot to {str(Path(MODELS_DIR) / f'equity_ppo_eurusd_{ts}.png')}")
+    print(f"Saved equity plot to {str(plot_path)}")
 
     try:
         plt.show()
