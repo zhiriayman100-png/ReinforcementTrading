@@ -8,7 +8,7 @@ A compact research playground for training Reinforcement Learning (RL) agents to
 - A training wrapper `train_agent.py` that runs training, checkpointing and evaluation
 - A Streamlit UI (`streamlit_app.py`) for interactive dataset selection, training and results
 
-Quick start
+## Quick start
 
 1. Install requirements (use a virtualenv):
 
@@ -22,7 +22,7 @@ Quick start
 
    python3 train_agent.py
 
-Where to look next
+# Where to look next
 
 - `env/` — the trading environment implementation and configuration (see `env/README.md`)
 - `agents/` — agent wrappers and examples (see `agents/README.md`)
