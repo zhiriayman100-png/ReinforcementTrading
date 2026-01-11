@@ -42,6 +42,164 @@ def evaluate_model(model, eval_env, deterministic: bool = True):
     return equity_curve, final_equity
 
 
+def train_and_evaluate(
+    df,
+    feature_cols,
+    model_type: str = "PPO",
+    total_timesteps: int = 20000,
+    ckpt_save_freq: int = 50000,
+    win: int = 30,
+    sl_opts: list | None = None,
+    tp_opts: list | None = None,
+    spread_pips: float = 1.0,
+    commission_pips: float = 0.0,
+    max_slippage_pips: float = 0.2,
+    random_start: bool = True,
+    min_episode_steps: int = 300,
+    episode_max_steps: int | None = None,
+    hold_reward_weight: float = 0.0,
+    open_penalty_pips: float = 0.0,
+    time_penalty_pips: float = 0.0,
+    unrealized_delta_weight: float = 0.0,
+    save_outputs: bool = True,
+):
+    """
+    Parameterized training wrapper for programmatic calls (eg. Streamlit).
+    Returns a dictionary with equity curves, final equities, plot & artifact paths.
+    """
+    if sl_opts is None:
+        sl_opts = [5, 10, 15, 25, 30]
+    if tp_opts is None:
+        tp_opts = [5, 10, 15, 25, 30]
+
+    # Time split 80/20
+    split_idx = int(len(df) * 0.8)
+    train_df = df.iloc[:split_idx].copy()
+    test_df = df.iloc[split_idx:].copy()
+
+    # Env factories using passed params
+    def make_env(random_start_local, df_for_env):
+        return ForexTradingEnv(
+            df=df_for_env,
+            window_size=win,
+            sl_options=sl_opts,
+            tp_options=tp_opts,
+            spread_pips=spread_pips,
+            commission_pips=commission_pips,
+            max_slippage_pips=max_slippage_pips,
+            random_start=random_start_local,
+            min_episode_steps=min_episode_steps,
+            episode_max_steps=episode_max_steps,
+            feature_columns=feature_cols,
+            hold_reward_weight=hold_reward_weight,
+            open_penalty_pips=open_penalty_pips,
+            time_penalty_pips=time_penalty_pips,
+            unrealized_delta_weight=unrealized_delta_weight,
+        )
+
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    train_vec_env = DummyVecEnv([lambda: make_env(True, train_df)])
+    train_eval_env = DummyVecEnv([lambda: make_env(False, train_df)])
+    test_eval_env = DummyVecEnv([lambda: make_env(False, test_df)])
+
+    # ---- Agent selection ----
+    model_type_up = model_type.upper()
+
+    if model_type_up == "PPO":
+        agent = PPOAgent.from_scratch(env=train_vec_env, policy="MlpPolicy", verbose=1, tensorboard_log=str(TENSORBOARD_DIR) + "/")
+        ckpt_prefix = "ppo_eurusd"
+    elif model_type_up == "DQN":
+        from agents.dqn_agent import DQNAgent
+
+        agent = DQNAgent.from_scratch(env=train_vec_env, policy="MlpPolicy", verbose=1,
+                                      tensorboard_log=str(TENSORBOARD_DIR) + "/", buffer_size=50000)
+        ckpt_prefix = "dqn_eurusd"
+    else:
+        raise ValueError(f"Unsupported model: {model_type}")
+
+    # ---- Checkpoints ----
+    checkpoint_callback = CheckpointCallback(
+        save_freq=int(ckpt_save_freq),
+        save_path=str(CKPT_DIR),
+        name_prefix=ckpt_prefix
+    )
+
+    # ---- Train ----
+    agent.train(env=train_vec_env, total_timesteps=int(total_timesteps), callback=checkpoint_callback)
+
+    # ---- Select best model by OOS final equity ----
+    equity_curve_test_last, final_equity_test_last = evaluate_model(agent, test_eval_env)
+    best_equity = final_equity_test_last
+    best_agent = agent
+
+    ckpts = sorted(
+        [f for f in os.listdir(str(CKPT_DIR)) if f.endswith(".zip") and f.startswith(ckpt_prefix)],
+        key=lambda x: os.path.getmtime(os.path.join(str(CKPT_DIR), x))
+    )
+
+    for ck in ckpts:
+        ck_path = os.path.join(str(CKPT_DIR), ck)
+        try:
+            if model_type_up == "PPO":
+                ck_agent = PPOAgent.load(ck_path, env=test_eval_env)
+            else:
+                from agents.dqn_agent import DQNAgent
+
+                ck_agent = DQNAgent.load(ck_path, env=test_eval_env)
+
+            _, final_eq = evaluate_model(ck_agent, test_eval_env)
+            if final_eq > best_equity:
+                best_equity = final_eq
+                best_agent = ck_agent
+        except Exception:
+            # skip checkpoints that cannot be evaluated
+            continue
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    model_dir = Path(MODELS_DIR) / f"{model_type_up.lower()}_eurusd_best_{ts}"
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save model (SB3 will append .zip)
+    model_path_base = model_dir / "model"
+    best_agent.save(str(model_path_base))
+
+    meta = {
+        "model_type": model_type_up,
+        "saved_at": ts,
+        "file": str(model_path_base) + ".zip",
+        "final_equity_test_last": float(final_equity_test_last),
+        "best_oos_equity": float(best_equity) if best_equity != -np.inf else None,
+        "total_timesteps": int(total_timesteps),
+    }
+    with open(model_dir / "meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    # ---- Final evaluations ----
+    equity_curve_train, final_equity_train = evaluate_model(best_agent, train_eval_env)
+    equity_curve_test, final_equity_test = evaluate_model(best_agent, test_eval_env)
+
+    plot_path = model_dir / "equity.png"
+    plot_equity_curves(
+        equity_curve_train,
+        equity_curve_test,
+        title="Equity Curves: In-sample vs Out-of-sample (Best Model)",
+        save_path=plot_path,
+    )
+
+    out = {
+        "equity_curve_train": equity_curve_train,
+        "equity_curve_test": equity_curve_test,
+        "final_equity_train": final_equity_train,
+        "final_equity_test": final_equity_test,
+        "equity_plot": str(plot_path),
+        "model_zip": str(model_path_base) + ".zip",
+        "meta_json": str(model_dir / "meta.json"),
+        "model_dir": str(model_dir),
+    }
+
+    return out
+
 
 def main():
     # Prefer existing files in the `data/` directory. You can override by setting
